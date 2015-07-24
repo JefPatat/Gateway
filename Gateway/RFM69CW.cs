@@ -105,7 +105,7 @@ namespace Gateway
 		}
 
 
-		private enum Mode
+		public enum Mode
 		{
 			RF69_MODE_SLEEP,	// 0: XTAL OFF
 			RF69_MODE_STANDBY,	// 1: XTAL ON
@@ -116,7 +116,7 @@ namespace Gateway
 
 		private byte nodeID = 0;
 		private byte PAYLOADLEN = 0;
-		private byte currentMode;
+		private Mode currentMode;
 		private const short CSMA_LIMIT = -90; // upper RX signal sensitivity threshold in dBm for carrier sense access
 		private const long RF69_CSMA_LIMIT_MS = 1000;
 		private InterruptPort interruptPin = new InterruptPort(GHI.Pins.Generic.GetPin('B', 12), false, Port.ResistorMode.Disabled, Port.InterruptMode.InterruptEdgeHigh);
@@ -153,30 +153,23 @@ namespace Gateway
 			WriteRegister(ConfigurationRegister.PacketConfig2, 0x12);
 			WriteRegister(ConfigurationRegister.TestDagc, 0x30);
 
-			  // Encryption is persistent between resets and can trip you up during debugging.
-			// Disable it during initialization so we always start from a known state.
-			Encrypt(null);
-
 			//setHighPower(_isRFM69HW); // called regardless if it's a RFM69W or RFM69HW
-			SetMode(1);
+			SetMode(Mode.RF69_MODE_STANDBY);
 			while ((ReadRegister(0x27) & 0x80) == 0x00) ; // wait for ModeReady
-			//attachInterrupt(_interruptNum, RFM69::isr0, RISING);
-
-			//selfPointer = this;
-			//_address = nodeID;
-			//return true;
-			ReadAllRegs();
+			OutputAllRegs();
 		}
 
 		void interruptPin_OnInterrupt(uint data1, uint data2, DateTime time)
 		{
+			// TODO: Can't send ACK here since in interrupt?
+
 			byte IrqFlags1 = ReadRegister(ConfigurationRegister.IrqFlags1);
 			byte IrqFlags2 = ReadRegister(ConfigurationRegister.IrqFlags2);
 			//Debug.Print("Interrupt1: " + IrqFlags1.ToString("X2") + " Interrupt2: " + IrqFlags2.ToString("X2"));
 			if ((IrqFlags2 & 0x04) != 0)
 			{
 				//RSSI = readRSSI();
-				SetMode(1);
+				SetMode(Mode.RF69_MODE_STANDBY);
 				PAYLOADLEN = ReadRegister(ConfigurationRegister.Fifo);
 				byte[] receiveBuffer = new byte[PAYLOADLEN];
 				writeBuffer[0] = (byte)((int)ConfigurationRegister.Fifo & 0x7F);
@@ -187,9 +180,9 @@ namespace Gateway
 
 				short nodeId = (short)(receiveBuffer[3] + (receiveBuffer[4] << 8));
 				uint uptime= (uint)Arrays.ExtractInt32(receiveBuffer, 5); //uptime in ms
-				float temp = Arrays.ExtractFloat(receiveBuffer, 9);;   //temperature maybe?
+				float temp = Arrays.ExtractFloat(receiveBuffer, 9); //temperature maybe?
 
-				//Debug.Print("Node ID: " + nodeId + ", uptime: " + uptime + ", temperature: " + temp + ", missed frames: " + missedFrames + ", correct frames: " + correctFrames + ", last missed frame: " + lastMissedUptime);
+				Debug.Print("Node ID: " + nodeId + ", uptime: " + uptime + ", temperature: " + temp + ", missed frames: " + missedFrames + ", correct frames: " + correctFrames + ", last missed frame: " + lastMissedUptime);
 
 				if(previousUptime == 0)
 				{
@@ -213,35 +206,8 @@ namespace Gateway
 					}
 					previousUptime = uptime;
 				}
-				//PAYLOADLEN = SPI.transfer(0);
-				//PAYLOADLEN = PAYLOADLEN > 66 ? 66 : PAYLOADLEN; // precaution
-				//TARGETID = SPI.transfer(0);
-				//if (!(_promiscuousMode || TARGETID == _address || TARGETID == RF69_BROADCAST_ADDR) // match this node's address, or broadcast address or anything in promiscuous mode
-				//   || PAYLOADLEN < 3) // address situation could receive packets that are malformed and don't fit this libraries extra fields
-				//{
-				//	PAYLOADLEN = 0;
-				//	unselect();
-				//	receiveBegin();
-				//	//digitalWrite(4, 0);
-				//	return;
-				//}
-
-				//DATALEN = PAYLOADLEN - 3;
-				//SENDERID = SPI.transfer(0);
-				//uint8_t CTLbyte = SPI.transfer(0);
-
-				//ACK_RECEIVED = CTLbyte & 0x80; // extract ACK-received flag
-				//ACK_REQUESTED = CTLbyte & 0x40; // extract ACK-requested flag
-
-				//for (uint8_t i = 0; i < DATALEN; i++)
-				//{
-				//	DATA[i] = SPI.transfer(0);
-				//}
-				//if (DATALEN < RF69_MAX_DATA_LEN) DATA[DATALEN] = 0; // add null at end of string
-				//unselect();
-				SetMode(3);
+				SetMode(Mode.RF69_MODE_RX);
 			}
-			//RSSI = readRSSI();
 		}
 
 		private byte[] writeBuffer = new byte[2];
@@ -278,7 +244,7 @@ namespace Gateway
 		public void SendFrame(byte remoteAddress, byte[] data, bool requestACK, bool sendACK)
 		{
 			interruptPin.DisableInterrupt();
-			SetMode(1); // turn off receiver to prevent reception while filling fifo
+			SetMode(Mode.RF69_MODE_STANDBY); // turn off receiver to prevent reception while filling fifo
 			while ((ReadRegister(ConfigurationRegister.IrqFlags1) & 0x80) == 0x00)
 			{ // wait for ModeReady
 			}
@@ -321,7 +287,7 @@ namespace Gateway
 			bool status = interruptPin.Read();
 
 			// no need to wait for transmit mode to be ready since its handled by the radio
-			SetMode(4);
+			SetMode(Mode.RF69_MODE_TX);
 			//status = interruptPin.Read();
 			long txStart = DateTime.Now.Ticks / 10000;
 			int counter = 0;
@@ -333,7 +299,7 @@ namespace Gateway
 			long txStop = DateTime.Now.Ticks / 10000;
 			long time = txStop - txStart;
 			//while (readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PACKETSENT == 0x00); // wait for ModeReady
-			SetMode(1);
+			SetMode(Mode.RF69_MODE_STANDBY);
 			interruptPin.EnableInterrupt();
 		}
 
@@ -345,7 +311,7 @@ namespace Gateway
 				WriteRegister(ConfigurationRegister.PacketConfig2, (byte)((ReadRegister(ConfigurationRegister.PacketConfig2) & 0xFB) | 0x04)); // avoid RX deadlocks
 			}
 			WriteRegister(ConfigurationRegister.DioMapping1, 0x40); // set DIO0 to "PAYLOADREADY" in receive mode
-			SetMode(3);
+			SetMode(Mode.RF69_MODE_RX);
 		}
 
 		// To enable encryption: radio.encrypt("ABCDEFGHIJKLMNOP");
@@ -353,7 +319,7 @@ namespace Gateway
 		// KEY HAS TO BE 16 bytes !!!
 		void Encrypt(string key)
 		{
-			SetMode(1);
+			SetMode(Mode.RF69_MODE_STANDBY);
 			if (key != null)
 			{
 				// TODO: Bruno: reenable
@@ -366,7 +332,7 @@ namespace Gateway
 			WriteRegister(ConfigurationRegister.PacketConfig2, (byte)((ReadRegister(ConfigurationRegister.PacketConfig2) & 0xFE) | (key != null ? 1 : 0)));
 		}
 
-		void ReadAllRegs()
+		void OutputAllRegs()
 		{
 			byte regVal;
 
@@ -377,32 +343,26 @@ namespace Gateway
 			}
 		}
 
-		public void DumpIRQRegisters()
-		{
-			Debug.Print("Interrupt1: " + ReadRegister(ConfigurationRegister.IrqFlags1).ToString("X2") + " Interrupt2: " + ReadRegister(ConfigurationRegister.IrqFlags2).ToString("X2"));
-		}
-
-		public void SetMode(byte newMode)
+		public void SetMode(Mode newMode)
 		{
 			if (newMode == currentMode)
 				return;
 
 			switch (newMode)
 			{
-				case 4:
+				case Mode.RF69_MODE_TX:
 					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x0C));
-
 					break;
-				case 3:
+				case Mode.RF69_MODE_RX:
 					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x10));
 					break;
-				case 2:
+				case Mode.RF69_MODE_SYNTH:
 					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x08));
 					break;
-				case 1:
+				case Mode.RF69_MODE_STANDBY:
 					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x04));
 					break;
-				case 0:
+				case Mode.RF69_MODE_SLEEP:
 					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x00));
 					break;
 				default:
