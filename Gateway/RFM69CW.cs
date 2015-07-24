@@ -3,11 +3,17 @@ using Microsoft.SPOT;
 using System.Threading;
 using Microsoft.SPOT.Hardware;
 
+using GHI.Utilities;
+
 namespace Gateway
 {
 	public class RFM69CW
 	{
 		private SPI spi = null;
+		private uint previousUptime = 0;
+		private uint lastMissedUptime = 0;
+		private uint missedFrames = 0;
+		private uint correctFrames = 0;
 
 		private enum ConfigurationRegister
 		{
@@ -17,7 +23,7 @@ namespace Gateway
 			BitrateMsb,		// 0x03
 			BitrateLsb,		// 0x04
 			FdevMsb,		// 0x05
-			Fdevlsb,		// 0x06
+			FdevLsb,		// 0x06
 			FrfMsb,			// 0x07
 			FrfMid,			// 0x08
 			FrfLsb,			// 0x09
@@ -52,102 +58,362 @@ namespace Gateway
 			DioMapping2,	// 0x26
 			IrqFlags1,		// 0x27
 			IrqFlags2,		// 0x28
-//#define REG_RSSITHRESH    0x29
-//#define REG_RXTIMEOUT1    0x2A
-//#define REG_RXTIMEOUT2    0x2B
-//#define REG_PREAMBLEMSB   0x2C
-//#define REG_PREAMBLELSB   0x2D
-//#define REG_SYNCCONFIG    0x2E
-//#define REG_SYNCVALUE1    0x2F
-//#define REG_SYNCVALUE2    0x30
-//#define REG_SYNCVALUE3    0x31
-//#define REG_SYNCVALUE4    0x32
-//#define REG_SYNCVALUE5    0x33
-//#define REG_SYNCVALUE6    0x34
-//#define REG_SYNCVALUE7    0x35
-//#define REG_SYNCVALUE8    0x36
-//#define REG_PACKETCONFIG1 0x37
-//#define REG_PAYLOADLENGTH 0x38
-//#define REG_NODEADRS      0x39
-//#define REG_BROADCASTADRS 0x3A
-//#define REG_AUTOMODES     0x3B
-//#define REG_FIFOTHRESH    0x3C
-//#define REG_PACKETCONFIG2 0x3D
-//#define REG_AESKEY1       0x3E
-//#define REG_AESKEY2       0x3F
-//#define REG_AESKEY3       0x40
-//#define REG_AESKEY4       0x41
-//#define REG_AESKEY5       0x42
-//#define REG_AESKEY6       0x43
-//#define REG_AESKEY7       0x44
-//#define REG_AESKEY8       0x45
-//#define REG_AESKEY9       0x46
-//#define REG_AESKEY10      0x47
-//#define REG_AESKEY11      0x48
-//#define REG_AESKEY12      0x49
-//#define REG_AESKEY13      0x4A
-//#define REG_AESKEY14      0x4B
-//#define REG_AESKEY15      0x4C
-//#define REG_AESKEY16      0x4D
-//#define REG_TEMP1         0x4E
-//#define REG_TEMP2         0x4F
-//#define REG_TESTLNA       0x58
-//#define REG_TESTPA1       0x5A  // only present on RFM69HW/SX1231H
-//#define REG_TESTPA2       0x5C  // only present on RFM69HW/SX1231H
-//#define REG_TESTDAGC      0x6F
+			RssiThresh,		// 0x29
+			RxTimeout1,		// 0x2A
+			RxTimeout2,		// 0x2B
+			PreambleMsb,	// 0x2C
+			PreambleLsv,	// 0x2D
+			SyncConfig,		// 0x2E
+			SyncValue1,		// 0x2F
+			SyncValue2,		// 0x30
+			SyncValue3,		// 0x31
+			SyncValue4,		// 0x32
+			SyncValue5,		// 0x33
+			SyncValue6,		// 0x34
+			SyncValue7,		// 0x35
+			SyncValue8,		// 0x36
+			PacketConfig1,	// 0x37
+			PayloadLength,	// 0x38
+			NodeAdrs,		// 0x39
+			BroadcastAdrs,	// 0x3A
+			AutoModes,		// 0x3B
+			FifoThresh,		// 0x3C
+			PacketConfig2,	// 0x3D
+			AesKey1,		// 0x3E
+			AesKey2,		// 0x3F
+			AesKey3,		// 0x40
+			AesKey4,		// 0x41
+			AesKey5,		// 0x42
+			AesKey6,		// 0x43
+			AesKey7,		// 0x44
+			AesKey8,		// 0x45
+			AesKey9,		// 0x46
+			AesKey10,		// 0x47
+			AesKey11,		// 0x48
+			AesKey12,		// 0x49
+			AesKey13,		// 0x4A
+			AesKey14,		// 0x4B
+			AesKey15,		// 0x4C
+			AesKey16,		// 0x4D
+			Temp1,			// 0x4E
+			Temp2,			// 0x4F
+			TestLna,		// 0x58
+			TestPa1,		// 0x5A
+			TestPa2,		// 0x5C
+			TestDagc = 0x6F,// 0x6F
+			TestAfc = 0x71,	// 0x71
 		}
 
 
-		public RFM69CW()
+		private enum Mode
 		{
-			spi = new SPI(new SPI.Configuration(GHI.Pins.Generic.GetPin('A', 15), false, 0, 0, false, true, 1000, SPI.SPI_module.SPI1));
+			RF69_MODE_SLEEP,	// 0: XTAL OFF
+			RF69_MODE_STANDBY,	// 1: XTAL ON
+			RF69_MODE_SYNTH,	// 2: PLL ON
+			RF69_MODE_RX,		// 3: RX MODE
+			RF69_MODE_TX,		// 4: TX MODE
+		}
 
-			WriteRegister(ConfigurationRegister.OpMode,	0x04);		// Sequencer on, listen off, standby mode
+		private byte nodeID = 0;
+		private byte PAYLOADLEN = 0;
+		private byte currentMode;
+		private const short CSMA_LIMIT = -90; // upper RX signal sensitivity threshold in dBm for carrier sense access
+		private const long RF69_CSMA_LIMIT_MS = 1000;
+		private InterruptPort interruptPin = new InterruptPort(GHI.Pins.Generic.GetPin('B', 12), false, Port.ResistorMode.Disabled, Port.InterruptMode.InterruptEdgeHigh);
+
+		public RFM69CW(byte networkID, byte nodeID)
+		{
+			interruptPin.OnInterrupt += interruptPin_OnInterrupt;
+			this.nodeID = nodeID;
+			spi = new SPI(new SPI.Configuration(GHI.Pins.Generic.GetPin('A', 15), false, 0, 0, false, true, 500, SPI.SPI_module.SPI1));
+
+			do WriteRegister(ConfigurationRegister.SyncValue1, 0xAA); while (ReadRegister(ConfigurationRegister.SyncValue1) != 0xAA);
+			do WriteRegister(ConfigurationRegister.SyncValue1, 0x55); while (ReadRegister(ConfigurationRegister.SyncValue1) != 0x55);
+
+			WriteRegister(ConfigurationRegister.OpMode, 0x04);		// Sequencer on, listen off, standby mode
 			WriteRegister(ConfigurationRegister.DataModul, 0x00);	// Packet mode, FSK, no shaping
 			WriteRegister(ConfigurationRegister.BitrateMsb, 0x02);	// Default 4.8 KBPS
 			WriteRegister(ConfigurationRegister.BitrateLsb, 0x40);
-			///* 0x05 */ { REG_FDEVMSB, RF_FDEVMSB_50000}, // default: 5KHz, (FDEV + BitRate / 2 <= 500KHz)
-			///* 0x06 */ { REG_FDEVLSB, RF_FDEVLSB_50000},
+			WriteRegister(ConfigurationRegister.FdevMsb, 0x03);		// Default: 5KHz, (FDEV + BitRate / 2 <= 500KHz)
+			WriteRegister(ConfigurationRegister.FdevLsb, 0x33);
+			WriteRegister(ConfigurationRegister.FrfMsb, 0xD9);		// 868 MHz
+			WriteRegister(ConfigurationRegister.FrfMid, 0x00);
+			WriteRegister(ConfigurationRegister.FrfLsb, 0x00);
+			WriteRegister(ConfigurationRegister.RxBw, 0x42);
+			WriteRegister(ConfigurationRegister.DioMapping1, 0x40);
+			WriteRegister(ConfigurationRegister.DioMapping2, 0x07);
+			WriteRegister(ConfigurationRegister.IrqFlags2, 0x10);
+			WriteRegister(ConfigurationRegister.RssiThresh, 220);
+			WriteRegister(ConfigurationRegister.SyncConfig, 0x88);
+			WriteRegister(ConfigurationRegister.SyncValue1, 0x2D);
+			WriteRegister(ConfigurationRegister.SyncValue2, networkID);
+			WriteRegister(ConfigurationRegister.PacketConfig1, 0x90);
+			WriteRegister(ConfigurationRegister.PayloadLength, 66);
+			WriteRegister(ConfigurationRegister.FifoThresh, 0x8F);
+			WriteRegister(ConfigurationRegister.PacketConfig2, 0x12);
+			WriteRegister(ConfigurationRegister.TestDagc, 0x30);
 
-			///* 0x07 */ { REG_FRFMSB, (uint8_t) (freqBand==RF69_315MHZ ? RF_FRFMSB_315 : (freqBand==RF69_433MHZ ? RF_FRFMSB_433 : (freqBand==RF69_868MHZ ? RF_FRFMSB_868 : RF_FRFMSB_915))) },
-			///* 0x08 */ { REG_FRFMID, (uint8_t) (freqBand==RF69_315MHZ ? RF_FRFMID_315 : (freqBand==RF69_433MHZ ? RF_FRFMID_433 : (freqBand==RF69_868MHZ ? RF_FRFMID_868 : RF_FRFMID_915))) },
-			///* 0x09 */ { REG_FRFLSB, (uint8_t) (freqBand==RF69_315MHZ ? RF_FRFLSB_315 : (freqBand==RF69_433MHZ ? RF_FRFLSB_433 : (freqBand==RF69_868MHZ ? RF_FRFLSB_868 : RF_FRFLSB_915))) },
+			  // Encryption is persistent between resets and can trip you up during debugging.
+			// Disable it during initialization so we always start from a known state.
+			Encrypt(null);
 
-			//// looks like PA1 and PA2 are not implemented on RFM69W, hence the max output power is 13dBm
-			//// +17dBm and +20dBm are possible on RFM69HW
-			//// +13dBm formula: Pout = -18 + OutputPower (with PA0 or PA1**)
-			//// +17dBm formula: Pout = -14 + OutputPower (with PA1 and PA2)**
-			//// +20dBm formula: Pout = -11 + OutputPower (with PA1 and PA2)** and high power PA settings (section 3.3.7 in datasheet)
-			/////* 0x11 */ { REG_PALEVEL, RF_PALEVEL_PA0_ON | RF_PALEVEL_PA1_OFF | RF_PALEVEL_PA2_OFF | RF_PALEVEL_OUTPUTPOWER_11111},
-			/////* 0x13 */ { REG_OCP, RF_OCP_ON | RF_OCP_TRIM_95 }, // over current protection (default is 95mA)
+			//setHighPower(_isRFM69HW); // called regardless if it's a RFM69W or RFM69HW
+			SetMode(1);
+			while ((ReadRegister(0x27) & 0x80) == 0x00) ; // wait for ModeReady
+			//attachInterrupt(_interruptNum, RFM69::isr0, RISING);
 
-			//// RXBW defaults are { REG_RXBW, RF_RXBW_DCCFREQ_010 | RF_RXBW_MANT_24 | RF_RXBW_EXP_5} (RxBw: 10.4KHz)
-			///* 0x19 */ { REG_RXBW, RF_RXBW_DCCFREQ_010 | RF_RXBW_MANT_16 | RF_RXBW_EXP_2 }, // (BitRate < 2 * RxBw)
-			////for BR-19200: /* 0x19 */ { REG_RXBW, RF_RXBW_DCCFREQ_010 | RF_RXBW_MANT_24 | RF_RXBW_EXP_3 },
-			///* 0x25 */ { REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_01 }, // DIO0 is the only IRQ we're using
-			///* 0x26 */ { REG_DIOMAPPING2, RF_DIOMAPPING2_CLKOUT_OFF }, // DIO5 ClkOut disable for power saving
-			///* 0x28 */ { REG_IRQFLAGS2, RF_IRQFLAGS2_FIFOOVERRUN }, // writing to this bit ensures that the FIFO & status flags are reset
-			///* 0x29 */ { REG_RSSITHRESH, 220 }, // must be set to dBm = (-Sensitivity / 2), default is 0xE4 = 228 so -114dBm
-			/////* 0x2D */ { REG_PREAMBLELSB, RF_PREAMBLESIZE_LSB_VALUE } // default 3 preamble bytes 0xAAAAAA
-			///* 0x2E */ { REG_SYNCCONFIG, RF_SYNC_ON | RF_SYNC_FIFOFILL_AUTO | RF_SYNC_SIZE_2 | RF_SYNC_TOL_0 },
-			///* 0x2F */ { REG_SYNCVALUE1, 0x2D },      // attempt to make this compatible with sync1 byte of RFM12B lib
-			///* 0x30 */ { REG_SYNCVALUE2, networkID }, // NETWORK ID
-			///* 0x37 */ { REG_PACKETCONFIG1, RF_PACKET1_FORMAT_VARIABLE | RF_PACKET1_DCFREE_OFF | RF_PACKET1_CRC_ON | RF_PACKET1_CRCAUTOCLEAR_ON | RF_PACKET1_ADRSFILTERING_OFF },
-			///* 0x38 */ { REG_PAYLOADLENGTH, 66 }, // in variable length mode: the max frame size, not used in TX
-			/////* 0x39 */ { REG_NODEADRS, nodeID }, // turned off because we're not using address filtering
-			///* 0x3C */ { REG_FIFOTHRESH, RF_FIFOTHRESH_TXSTART_FIFONOTEMPTY | RF_FIFOTHRESH_VALUE }, // TX on FIFO not empty
-			///* 0x3D */ { REG_PACKETCONFIG2, RF_PACKET2_RXRESTARTDELAY_2BITS | RF_PACKET2_AUTORXRESTART_ON | RF_PACKET2_AES_OFF }, // RXRESTARTDELAY must match transmitter PA ramp-down time (bitrate dependent)
-			////for BR-19200: /* 0x3D */ { REG_PACKETCONFIG2, RF_PACKET2_RXRESTARTDELAY_NONE | RF_PACKET2_AUTORXRESTART_ON | RF_PACKET2_AES_OFF }, // RXRESTARTDELAY must match transmitter PA ramp-down time (bitrate dependent)
-			///* 0x6F */ { REG_TESTDAGC, RF_DAGC_IMPROVED_LOWBETA0 }, // run DAGC continuously in RX mode for Fading Margin Improvement, recommended default for AfcLowBetaOn=0
-			//{255, 0}
+			//selfPointer = this;
+			//_address = nodeID;
+			//return true;
+			ReadAllRegs();
+		}
+
+		void interruptPin_OnInterrupt(uint data1, uint data2, DateTime time)
+		{
+			byte IrqFlags1 = ReadRegister(ConfigurationRegister.IrqFlags1);
+			byte IrqFlags2 = ReadRegister(ConfigurationRegister.IrqFlags2);
+			//Debug.Print("Interrupt1: " + IrqFlags1.ToString("X2") + " Interrupt2: " + IrqFlags2.ToString("X2"));
+			if ((IrqFlags2 & 0x04) != 0)
+			{
+				//RSSI = readRSSI();
+				SetMode(1);
+				PAYLOADLEN = ReadRegister(ConfigurationRegister.Fifo);
+				byte[] receiveBuffer = new byte[PAYLOADLEN];
+				writeBuffer[0] = (byte)((int)ConfigurationRegister.Fifo & 0x7F);
+				spi.WriteRead(writeBuffer, receiveBuffer, 1);
+				byte TARGETID = receiveBuffer[0];
+				byte SENDERID = receiveBuffer[1];
+				byte CTLbyte = receiveBuffer[2];
+
+				short nodeId = (short)(receiveBuffer[3] + (receiveBuffer[4] << 8));
+				uint uptime= (uint)Arrays.ExtractInt32(receiveBuffer, 5); //uptime in ms
+				float temp = Arrays.ExtractFloat(receiveBuffer, 9);;   //temperature maybe?
+
+				//Debug.Print("Node ID: " + nodeId + ", uptime: " + uptime + ", temperature: " + temp + ", missed frames: " + missedFrames + ", correct frames: " + correctFrames + ", last missed frame: " + lastMissedUptime);
+
+				if(previousUptime == 0)
+				{
+					previousUptime = uptime;
+				}
+				else
+				{
+					if(uptime - previousUptime > 1500)
+					{
+						missedFrames++;
+						lastMissedUptime = uptime;
+						Debug.Print("Missed: " + missedFrames + ", correct: " + correctFrames);
+					}
+					else
+					{
+						correctFrames++;
+						if(correctFrames%100 == 0)
+						{
+							Debug.Print("Missed: " + missedFrames + ", correct: " + correctFrames);
+						}
+					}
+					previousUptime = uptime;
+				}
+				//PAYLOADLEN = SPI.transfer(0);
+				//PAYLOADLEN = PAYLOADLEN > 66 ? 66 : PAYLOADLEN; // precaution
+				//TARGETID = SPI.transfer(0);
+				//if (!(_promiscuousMode || TARGETID == _address || TARGETID == RF69_BROADCAST_ADDR) // match this node's address, or broadcast address or anything in promiscuous mode
+				//   || PAYLOADLEN < 3) // address situation could receive packets that are malformed and don't fit this libraries extra fields
+				//{
+				//	PAYLOADLEN = 0;
+				//	unselect();
+				//	receiveBegin();
+				//	//digitalWrite(4, 0);
+				//	return;
+				//}
+
+				//DATALEN = PAYLOADLEN - 3;
+				//SENDERID = SPI.transfer(0);
+				//uint8_t CTLbyte = SPI.transfer(0);
+
+				//ACK_RECEIVED = CTLbyte & 0x80; // extract ACK-received flag
+				//ACK_REQUESTED = CTLbyte & 0x40; // extract ACK-requested flag
+
+				//for (uint8_t i = 0; i < DATALEN; i++)
+				//{
+				//	DATA[i] = SPI.transfer(0);
+				//}
+				//if (DATALEN < RF69_MAX_DATA_LEN) DATA[DATALEN] = 0; // add null at end of string
+				//unselect();
+				SetMode(3);
+			}
+			//RSSI = readRSSI();
 		}
 
 		private byte[] writeBuffer = new byte[2];
+		private byte[] readBuffer = new byte[2];
 		private void WriteRegister(ConfigurationRegister register, byte value)
 		{
 			writeBuffer[0] = (byte)((int)register | 0x80);
 			writeBuffer[1] = value;
 			spi.Write(writeBuffer);
+		}
+
+		private void WriteRegister(byte register, byte value)
+		{
+			writeBuffer[0] = (byte)(register | 0x80);
+			writeBuffer[1] = value;
+			spi.Write(writeBuffer);
+		}
+
+		private byte ReadRegister(ConfigurationRegister register)
+		{
+			writeBuffer[0] = (byte)((int)register & 0x7F);
+			spi.WriteRead(writeBuffer, readBuffer);
+			return readBuffer[1];
+		}
+
+		private byte ReadRegister(byte register)
+		{
+			writeBuffer[0] = (byte)((int)register & 0x7F);
+			spi.WriteRead(writeBuffer, readBuffer);
+			return readBuffer[1];
+		}
+
+		// internal function
+		public void SendFrame(byte remoteAddress, byte[] data, bool requestACK, bool sendACK)
+		{
+			interruptPin.DisableInterrupt();
+			SetMode(1); // turn off receiver to prevent reception while filling fifo
+			while ((ReadRegister(ConfigurationRegister.IrqFlags1) & 0x80) == 0x00)
+			{ // wait for ModeReady
+			}
+			WriteRegister(ConfigurationRegister.DioMapping1, 0x00); // DIO0 is "Packet Sent"
+			if (data.Length > 61)
+			{
+				throw new Exception("data too long");
+			}
+
+			// control byte
+
+			byte CTLbyte = 0x00;
+			if (sendACK)
+			{
+				CTLbyte = 0x80;
+			}
+			else if (requestACK)
+			{
+				CTLbyte = 0x40;
+			}
+			byte[] txData = new byte[data.Length + 5];
+			txData[0] = 0x00 | 0x80;
+			txData[1] = (byte)(data.Length + 3);
+			txData[2] = remoteAddress;
+			txData[3] = nodeID;
+			txData[4] = CTLbyte;
+			Array.Copy(data, 0, txData, 5, data.Length);
+			//// write to FIFO
+			//select();
+			//SPI.transfer(REG_FIFO | 0x80);
+			//SPI.transfer(bufferSize + 3);
+			//SPI.transfer(toAddress);
+			//SPI.transfer(_address);
+			//SPI.transfer(CTLbyte);
+
+			//for (uint8_t i = 0; i < bufferSize; i++)
+			//SPI.transfer(((uint8_t*) buffer)[i]);
+			//unselect();
+			spi.Write(txData);
+			bool status = interruptPin.Read();
+
+			// no need to wait for transmit mode to be ready since its handled by the radio
+			SetMode(4);
+			//status = interruptPin.Read();
+			long txStart = DateTime.Now.Ticks / 10000;
+			int counter = 0;
+			while (interruptPin.Read() == false && DateTime.Now.Ticks / 10000 - txStart < 1000)
+			{
+				// wait for DIO0 to turn HIGH signalling transmission finish
+				counter++;
+			}
+			long txStop = DateTime.Now.Ticks / 10000;
+			long time = txStop - txStart;
+			//while (readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PACKETSENT == 0x00); // wait for ModeReady
+			SetMode(1);
+			interruptPin.EnableInterrupt();
+		}
+
+		public void ReceiveBegin()
+		{
+			byte temp = ReadRegister(ConfigurationRegister.IrqFlags2);
+			if ((ReadRegister(ConfigurationRegister.IrqFlags2) & 0x04) == 0x04)
+			{
+				WriteRegister(ConfigurationRegister.PacketConfig2, (byte)((ReadRegister(ConfigurationRegister.PacketConfig2) & 0xFB) | 0x04)); // avoid RX deadlocks
+			}
+			WriteRegister(ConfigurationRegister.DioMapping1, 0x40); // set DIO0 to "PAYLOADREADY" in receive mode
+			SetMode(3);
+		}
+
+		// To enable encryption: radio.encrypt("ABCDEFGHIJKLMNOP");
+		// To disable encryption: radio.encrypt(null) or radio.encrypt(0)
+		// KEY HAS TO BE 16 bytes !!!
+		void Encrypt(string key)
+		{
+			SetMode(1);
+			if (key != null)
+			{
+				// TODO: Bruno: reenable
+				//select();
+				//SPI.transfer(REG_AESKEY1 | 0x80);
+				//for (uint8_t i = 0; i < 16; i++)
+				//SPI.transfer(key[i]);
+				//unselect();
+			}
+			WriteRegister(ConfigurationRegister.PacketConfig2, (byte)((ReadRegister(ConfigurationRegister.PacketConfig2) & 0xFE) | (key != null ? 1 : 0)));
+		}
+
+		void ReadAllRegs()
+		{
+			byte regVal;
+
+			for (byte regAddr = 1; regAddr <= 0x4F; regAddr++)
+			{
+				regVal = ReadRegister(regAddr);
+				Debug.Print(regAddr.ToString("X2") + " - " + regVal.ToString("X2"));
+			}
+		}
+
+		public void DumpIRQRegisters()
+		{
+			Debug.Print("Interrupt1: " + ReadRegister(ConfigurationRegister.IrqFlags1).ToString("X2") + " Interrupt2: " + ReadRegister(ConfigurationRegister.IrqFlags2).ToString("X2"));
+		}
+
+		public void SetMode(byte newMode)
+		{
+			if (newMode == currentMode)
+				return;
+
+			switch (newMode)
+			{
+				case 4:
+					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x0C));
+
+					break;
+				case 3:
+					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x10));
+					break;
+				case 2:
+					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x08));
+					break;
+				case 1:
+					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x04));
+					break;
+				case 0:
+					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x00));
+					break;
+				default:
+					return;
+			}
+
+			// we are using packet mode, so this check is not really needed
+			// but waiting for mode ready is necessary when going from sleep because the FIFO may not be immediately available from previous mode
+			while (currentMode == 0 && (ReadRegister(0x27) & 0x80) == 0x00) ; // wait for ModeReady
+
+			currentMode = newMode;
 		}
 	}
 }

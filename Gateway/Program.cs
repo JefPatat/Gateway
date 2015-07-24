@@ -8,46 +8,36 @@ namespace Gateway
 {
 	public class Program
 	{
-		static SPI MySPI = null;
+		static RFM69CW rfm69CW = null;
 
 		public static void Main()
 		{
-			SPI.Configuration MyConfig = null;
 			try
 			{
-				MyConfig = new SPI.Configuration(GHI.Pins.Generic.GetPin('A', 15), false, 0, 0, false, true, 1000, SPI.SPI_module.SPI1);
-				MySPI = new SPI(MyConfig);
+				rfm69CW = new RFM69CW(100, 1);
 			}
 			catch (Exception ex)
 			{
 
 			}
 
-			for (byte address = 0; address < 0x10; address++)
+			rfm69CW.ReceiveBegin();
+			while (true)
 			{
-				byte contents = ReadReg(address);
-				Debug.Print(address.ToString("x2") + ": " + contents.ToString("x2"));
+				//rfm69CW.DumpIRQRegisters();
+				System.Threading.Thread.Sleep(30);
 			}
-
-			for (byte address = 0; address < 0x10; address++)
-			{
-				byte contents = ReadRegAlternative(address);
-				Debug.Print(address.ToString("X2") + ": " + contents.ToString("x2"));
-			}
-		}
-
-		static byte ReadReg(byte addr)
-		{
-			byte[] result = new byte[1];
-			MySPI.WriteRead(new byte[] { (byte)(addr & 0x7F) }, result, 1);
-			return result[0];
-		}
-
-		static byte ReadRegAlternative(byte addr)
-		{
-			byte[] result = new byte[2];
-			MySPI.WriteRead(new byte[] { (byte)(addr & 0x7F) }, result);
-			return result[1];
+			//byte[] data = new byte[] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+			//while(true)
+			//{
+			//	for (byte i = 0; i < 10; i++)
+			//	{
+			//		data[2] = i;
+			//		//rfm69CW.SendFrame(1, data, true, false);
+			//		Debug.Print("Tx: " + i);
+			//		System.Threading.Thread.Sleep(1000);
+			//	}
+			//}
 		}
 	}
 }
