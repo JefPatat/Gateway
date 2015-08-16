@@ -10,10 +10,6 @@ namespace Gateway
 	public class RFM69CW
 	{
 		private SPI spi = null;
-		private uint previousUptime = 0;
-		private uint lastMissedUptime = 0;
-		private uint missedFrames = 0;
-		private uint correctFrames = 0;
 
 		private enum ConfigurationRegister
 		{
@@ -117,8 +113,8 @@ namespace Gateway
 		private byte nodeID = 0;
 		private byte PAYLOADLEN = 0;
 		private Mode currentMode;
-		private const short CSMA_LIMIT = -90; // upper RX signal sensitivity threshold in dBm for carrier sense access
-		private const long RF69_CSMA_LIMIT_MS = 1000;
+		//private const short CSMA_LIMIT = -90; // upper RX signal sensitivity threshold in dBm for carrier sense access
+		//private const long RF69_CSMA_LIMIT_MS = 1000;
 		private InterruptPort interruptPin = new InterruptPort(GHI.Pins.Generic.GetPin('B', 12), false, Port.ResistorMode.Disabled, Port.InterruptMode.InterruptEdgeHigh);
 
 		public RFM69CW(byte networkID, byte nodeID)
@@ -156,16 +152,11 @@ namespace Gateway
 			//setHighPower(_isRFM69HW); // called regardless if it's a RFM69W or RFM69HW
 			SetMode(Mode.RF69_MODE_STANDBY);
 			while ((ReadRegister(0x27) & 0x80) == 0x00) ; // wait for ModeReady
-			OutputAllRegs();
 		}
 
 		void interruptPin_OnInterrupt(uint data1, uint data2, DateTime time)
 		{
-			// TODO: Can't send ACK here since in interrupt?
-
-			byte IrqFlags1 = ReadRegister(ConfigurationRegister.IrqFlags1);
 			byte IrqFlags2 = ReadRegister(ConfigurationRegister.IrqFlags2);
-			//Debug.Print("Interrupt1: " + IrqFlags1.ToString("X2") + " Interrupt2: " + IrqFlags2.ToString("X2"));
 			if ((IrqFlags2 & 0x04) != 0)
 			{
 				//RSSI = readRSSI();
@@ -174,38 +165,9 @@ namespace Gateway
 				byte[] receiveBuffer = new byte[PAYLOADLEN];
 				writeBuffer[0] = (byte)((int)ConfigurationRegister.Fifo & 0x7F);
 				spi.WriteRead(writeBuffer, receiveBuffer, 1);
-				byte TARGETID = receiveBuffer[0];
-				byte SENDERID = receiveBuffer[1];
-				byte CTLbyte = receiveBuffer[2];
-
-				short nodeId = (short)(receiveBuffer[3] + (receiveBuffer[4] << 8));
-				uint uptime= (uint)Arrays.ExtractInt32(receiveBuffer, 5); //uptime in ms
-				float temp = Arrays.ExtractFloat(receiveBuffer, 9); //temperature maybe?
-
-				Debug.Print("Node ID: " + nodeId + ", uptime: " + uptime + ", temperature: " + temp + ", missed frames: " + missedFrames + ", correct frames: " + correctFrames + ", last missed frame: " + lastMissedUptime);
-
-				if(previousUptime == 0)
-				{
-					previousUptime = uptime;
-				}
-				else
-				{
-					if(uptime - previousUptime > 1500)
-					{
-						missedFrames++;
-						lastMissedUptime = uptime;
-						Debug.Print("Missed: " + missedFrames + ", correct: " + correctFrames);
-					}
-					else
-					{
-						correctFrames++;
-						if(correctFrames%100 == 0)
-						{
-							Debug.Print("Missed: " + missedFrames + ", correct: " + correctFrames);
-						}
-					}
-					previousUptime = uptime;
-				}
+				// TODO? HopeRF democode clears the FIFO on purpose, not a bad idea to prevent lockup
+				// setMode(RFM69_MODE_STDBY);
+				// setMode(RFM69_MODE_RX);
 				SetMode(Mode.RF69_MODE_RX);
 			}
 		}
@@ -272,17 +234,6 @@ namespace Gateway
 			txData[3] = nodeID;
 			txData[4] = CTLbyte;
 			Array.Copy(data, 0, txData, 5, data.Length);
-			//// write to FIFO
-			//select();
-			//SPI.transfer(REG_FIFO | 0x80);
-			//SPI.transfer(bufferSize + 3);
-			//SPI.transfer(toAddress);
-			//SPI.transfer(_address);
-			//SPI.transfer(CTLbyte);
-
-			//for (uint8_t i = 0; i < bufferSize; i++)
-			//SPI.transfer(((uint8_t*) buffer)[i]);
-			//unselect();
 			spi.Write(txData);
 			bool status = interruptPin.Read();
 
@@ -312,24 +263,6 @@ namespace Gateway
 			}
 			WriteRegister(ConfigurationRegister.DioMapping1, 0x40); // set DIO0 to "PAYLOADREADY" in receive mode
 			SetMode(Mode.RF69_MODE_RX);
-		}
-
-		// To enable encryption: radio.encrypt("ABCDEFGHIJKLMNOP");
-		// To disable encryption: radio.encrypt(null) or radio.encrypt(0)
-		// KEY HAS TO BE 16 bytes !!!
-		void Encrypt(string key)
-		{
-			SetMode(Mode.RF69_MODE_STANDBY);
-			if (key != null)
-			{
-				// TODO: Bruno: reenable
-				//select();
-				//SPI.transfer(REG_AESKEY1 | 0x80);
-				//for (uint8_t i = 0; i < 16; i++)
-				//SPI.transfer(key[i]);
-				//unselect();
-			}
-			WriteRegister(ConfigurationRegister.PacketConfig2, (byte)((ReadRegister(ConfigurationRegister.PacketConfig2) & 0xFE) | (key != null ? 1 : 0)));
 		}
 
 		void OutputAllRegs()
