@@ -4,13 +4,31 @@ using System.Threading;
 using Microsoft.SPOT.Hardware;
 
 using GHI.Utilities;
+using System.Collections;
+
+// The general model of this class is to be always receiving messages except when sending
+//
+// 100% bidirectional throughput cannot be guaranteed, messages can be lost due to:
+// - radio interference from other devices
+// - collision of transmissions
+// - a message is in the process of being received when switching to transmit mode 
+//
+// Additional complexity arises due to the .NET MF interrupt architecture. Interrupts are not
+// real time interrupts but rather delayed events. This means that an interrupt might be 'waiting'
+// while the main loop is executing.
+// 
+// Due to the very low throughput required, the limited time to test all this and the fact that
+// this wireless transmission cannot be perfectly guaranteed no efforts were made to optimize it.
+//
+// Ideas that could increase throughput:
+// - check the RSSI to ensure the radio channel is free before starting a transmission
+// - check if a receive interrupt is pending before starting a transmission and if so handle this
+//   interrupt first
 
 namespace Gateway
 {
 	public class RFM69CW
 	{
-		private SPI spi = null;
-
 		private enum ConfigurationRegister
 		{
 			Fifo,			// 0x00
@@ -100,58 +118,87 @@ namespace Gateway
 			TestAfc = 0x71,	// 0x71
 		}
 
-
 		public enum Mode
 		{
-			RF69_MODE_SLEEP,	// 0: XTAL OFF
-			RF69_MODE_STANDBY,	// 1: XTAL ON
-			RF69_MODE_SYNTH,	// 2: PLL ON
-			RF69_MODE_RX,		// 3: RX MODE
-			RF69_MODE_TX,		// 4: TX MODE
+			MODE_SLEEP,
+			MODE_STANDBY,
+			MODE_SYNTH,
+			MODE_RX,
+			MODE_TX,
 		}
 
+		private AutoResetEvent transmissionCompleteEvent = new AutoResetEvent(false);
 		private byte nodeID = 0;
-		private byte PAYLOADLEN = 0;
-		private Mode currentMode;
-		//private const short CSMA_LIMIT = -90; // upper RX signal sensitivity threshold in dBm for carrier sense access
-		//private const long RF69_CSMA_LIMIT_MS = 1000;
+		// Maximum  payload length with AES and address filtering enabled, datasheet p52
+		// AES and address filtering are not enabled for the moment, but 64 is enough for now
+		private const byte maxPayloadLength = 64;
 		private InterruptPort interruptPin = new InterruptPort(GHI.Pins.Generic.GetPin('B', 12), false, Port.ResistorMode.Disabled, Port.InterruptMode.InterruptEdgeHigh);
+		private Mode currentMode;
+		private object receptionQueueLock = new object();
+		private Queue receptionQueue = new Queue();
+		private SPI spi = null;
 
 		public RFM69CW(byte networkID, byte nodeID)
 		{
 			interruptPin.OnInterrupt += interruptPin_OnInterrupt;
 			this.nodeID = nodeID;
-			spi = new SPI(new SPI.Configuration(GHI.Pins.Generic.GetPin('A', 15), false, 0, 0, false, true, 500, SPI.SPI_module.SPI1));
+			spi = new SPI(new SPI.Configuration(GHI.Pins.Generic.GetPin('A', 15), false, 0, 0, false, true, 2000, SPI.SPI_module.SPI1));
 
-			do WriteRegister(ConfigurationRegister.SyncValue1, 0xAA); while (ReadRegister(ConfigurationRegister.SyncValue1) != 0xAA);
-			do WriteRegister(ConfigurationRegister.SyncValue1, 0x55); while (ReadRegister(ConfigurationRegister.SyncValue1) != 0x55);
+			do
+			{
+				WriteRegister(ConfigurationRegister.SyncValue1, 0xAA);
+			}while (ReadRegister(ConfigurationRegister.SyncValue1) != 0xAA);
+			do
+			{
+				WriteRegister(ConfigurationRegister.SyncValue1, 0x55);
+			}while (ReadRegister(ConfigurationRegister.SyncValue1) != 0x55);
 
-			WriteRegister(ConfigurationRegister.OpMode, 0x04);		// Sequencer on, listen off, standby mode
-			WriteRegister(ConfigurationRegister.DataModul, 0x00);	// Packet mode, FSK, no shaping
-			WriteRegister(ConfigurationRegister.BitrateMsb, 0x02);	// Default 4.8 KBPS
+			// Most settings are taken over from Monteino lib for compatibility
+			// Some settings are default
+			// TODO: clean up, warning: when cleaning up reset the device by repowering
+			//       previous attempts failed, be carefull when doing this
+
+			// Custom bitrate of 55555 to match Monteino lib
+			WriteRegister(ConfigurationRegister.BitrateMsb, 0x02);
 			WriteRegister(ConfigurationRegister.BitrateLsb, 0x40);
-			WriteRegister(ConfigurationRegister.FdevMsb, 0x03);		// Default: 5KHz, (FDEV + BitRate / 2 <= 500KHz)
+			
+			// Frequency deviation of 50 kHz to match Monteino lib
+			WriteRegister(ConfigurationRegister.FdevMsb, 0x03);
 			WriteRegister(ConfigurationRegister.FdevLsb, 0x33);
-			WriteRegister(ConfigurationRegister.FrfMsb, 0xD9);		// 868 MHz
+			
+			// 868 MHz
+			WriteRegister(ConfigurationRegister.FrfMsb, 0xD9);
 			WriteRegister(ConfigurationRegister.FrfMid, 0x00);
 			WriteRegister(ConfigurationRegister.FrfLsb, 0x00);
+			
+			// Custom Channel Filter BW Control to match Monteino lib
 			WriteRegister(ConfigurationRegister.RxBw, 0x42);
 			WriteRegister(ConfigurationRegister.DioMapping1, 0x40);
 			WriteRegister(ConfigurationRegister.DioMapping2, 0x07);
 			WriteRegister(ConfigurationRegister.IrqFlags2, 0x10);
 			WriteRegister(ConfigurationRegister.RssiThresh, 220);
+			
+			// Custom syncing to match Monteino lib
 			WriteRegister(ConfigurationRegister.SyncConfig, 0x88);
 			WriteRegister(ConfigurationRegister.SyncValue1, 0x2D);
 			WriteRegister(ConfigurationRegister.SyncValue2, networkID);
+			
+			// Variable packet length with CRC enabled
 			WriteRegister(ConfigurationRegister.PacketConfig1, 0x90);
+
+			// Maximum payload length
 			WriteRegister(ConfigurationRegister.PayloadLength, 66);
 			WriteRegister(ConfigurationRegister.FifoThresh, 0x8F);
+			// InterPacketRxDelay of 2 bits, AutoRxRestartOn on, AES off
 			WriteRegister(ConfigurationRegister.PacketConfig2, 0x12);
 			WriteRegister(ConfigurationRegister.TestDagc, 0x30);
+			
+			// TODO: SetHighPower for H version
 
-			//setHighPower(_isRFM69HW); // called regardless if it's a RFM69W or RFM69HW
-			SetMode(Mode.RF69_MODE_STANDBY);
-			while ((ReadRegister(0x27) & 0x80) == 0x00) ; // wait for ModeReady
+			SetMode(Mode.MODE_STANDBY);
+
+
+			EnableReceiver();
 		}
 
 		void interruptPin_OnInterrupt(uint data1, uint data2, DateTime time)
@@ -159,16 +206,29 @@ namespace Gateway
 			byte IrqFlags2 = ReadRegister(ConfigurationRegister.IrqFlags2);
 			if ((IrqFlags2 & 0x04) != 0)
 			{
-				//RSSI = readRSSI();
-				SetMode(Mode.RF69_MODE_STANDBY);
-				PAYLOADLEN = ReadRegister(ConfigurationRegister.Fifo);
-				byte[] receiveBuffer = new byte[PAYLOADLEN];
+				// Setting the mode to standby and then back to RX ensures the FIFO is cleared
+				// and a new reception can begin
+				SetMode(Mode.MODE_STANDBY);
+
+				SWPMessage message = new SWPMessage();
+				byte messageLength = ReadRegister(ConfigurationRegister.Fifo);
+				message.RSSI = (short)-(ReadRegister(ConfigurationRegister.RssiValue) / 2);
+				message.DestinationAddress = ReadRegister(ConfigurationRegister.Fifo);
+				message.SourceAddress = ReadRegister(ConfigurationRegister.Fifo);
+				message.ServiceIdentifier = ReadRegister(ConfigurationRegister.Fifo);
+				message.Data = new byte[messageLength - 3];
 				writeBuffer[0] = (byte)((int)ConfigurationRegister.Fifo & 0x7F);
-				spi.WriteRead(writeBuffer, receiveBuffer, 1);
-				// TODO? HopeRF democode clears the FIFO on purpose, not a bad idea to prevent lockup
-				// setMode(RFM69_MODE_STDBY);
-				// setMode(RFM69_MODE_RX);
-				SetMode(Mode.RF69_MODE_RX);
+				spi.WriteRead(writeBuffer, message.Data, 1);
+
+				SetMode(Mode.MODE_RX);
+
+				lock (receptionQueueLock)
+				{
+					if (receptionQueue.Count < 10)
+					{
+						receptionQueue.Enqueue(message);
+					}
+				}
 			}
 		}
 
@@ -180,100 +240,87 @@ namespace Gateway
 			writeBuffer[1] = value;
 			spi.Write(writeBuffer);
 		}
-
-		private void WriteRegister(byte register, byte value)
-		{
-			writeBuffer[0] = (byte)(register | 0x80);
-			writeBuffer[1] = value;
-			spi.Write(writeBuffer);
-		}
-
+		
 		private byte ReadRegister(ConfigurationRegister register)
 		{
 			writeBuffer[0] = (byte)((int)register & 0x7F);
 			spi.WriteRead(writeBuffer, readBuffer);
 			return readBuffer[1];
 		}
-
-		private byte ReadRegister(byte register)
+		
+		public int NumberOfQueuedReceivedMessage()
 		{
-			writeBuffer[0] = (byte)((int)register & 0x7F);
-			spi.WriteRead(writeBuffer, readBuffer);
-			return readBuffer[1];
+			byte IrqFlags2 = ReadRegister(ConfigurationRegister.IrqFlags2);
+			int result;
+			lock (receptionQueueLock)
+			{
+				result = receptionQueue.Count;
+			}
+			return result;
 		}
 
-		// internal function
-		public void SendFrame(byte remoteAddress, byte[] data, bool requestACK, bool sendACK)
+		public SWPMessage DequeueReceivedMessage()
 		{
-			interruptPin.DisableInterrupt();
-			SetMode(Mode.RF69_MODE_STANDBY); // turn off receiver to prevent reception while filling fifo
-			while ((ReadRegister(ConfigurationRegister.IrqFlags1) & 0x80) == 0x00)
-			{ // wait for ModeReady
+			SWPMessage result;
+			lock(receptionQueueLock)
+			{
+				result = (SWPMessage)receptionQueue.Dequeue();
 			}
-			WriteRegister(ConfigurationRegister.DioMapping1, 0x00); // DIO0 is "Packet Sent"
-			if (data.Length > 61)
+			return result;
+		}
+
+		public void SendMessage(SWPMessage message)
+		{
+			// Disable reception and clear the FIFO
+			SetMode(Mode.MODE_STANDBY);
+			while ((ReadRegister(ConfigurationRegister.IrqFlags2) & 0x40) == 0x40)
+			{
+				ReadRegister(ConfigurationRegister.Fifo);
+			}
+
+			// set DIO0 to PacketSent
+			WriteRegister(ConfigurationRegister.DioMapping1, 0x00);
+
+			if (message.Data.Length > maxPayloadLength - 2)
 			{
 				throw new Exception("data too long");
 			}
 
-			// control byte
-
-			byte CTLbyte = 0x00;
-			if (sendACK)
-			{
-				CTLbyte = 0x80;
-			}
-			else if (requestACK)
-			{
-				CTLbyte = 0x40;
-			}
-			byte[] txData = new byte[data.Length + 5];
+			byte[] txData = new byte[message.Data.Length + 5];
 			txData[0] = 0x00 | 0x80;
-			txData[1] = (byte)(data.Length + 3);
-			txData[2] = remoteAddress;
-			txData[3] = nodeID;
-			txData[4] = CTLbyte;
-			Array.Copy(data, 0, txData, 5, data.Length);
+			txData[1] = (byte)(message.Data.Length + 3);
+			txData[2] = message.DestinationAddress;
+			txData[3] = message.SourceAddress;
+			txData[4] = message.ServiceIdentifier;
+			Array.Copy(message.Data, 0, txData, 5, message.Data.Length);
 			spi.Write(txData);
-			bool status = interruptPin.Read();
+			SetMode(Mode.MODE_TX);
 
-			// no need to wait for transmit mode to be ready since its handled by the radio
-			SetMode(Mode.RF69_MODE_TX);
-			//status = interruptPin.Read();
-			long txStart = DateTime.Now.Ticks / 10000;
-			int counter = 0;
-			while (interruptPin.Read() == false && DateTime.Now.Ticks / 10000 - txStart < 1000)
+			// We could handle the interrupt in the interrupt handler but due to the .NET MF
+			// interrupt model that would be rather slow. It is faster to poll the interrupt.
+			// Speeding things up here allows the other side to respond faster.
+
+			byte IrqFlags2 = ReadRegister(ConfigurationRegister.IrqFlags2);
+			while ((IrqFlags2 & 0x08) == 0)
 			{
-				// wait for DIO0 to turn HIGH signalling transmission finish
-				counter++;
+				IrqFlags2 = ReadRegister(ConfigurationRegister.IrqFlags2);
 			}
-			long txStop = DateTime.Now.Ticks / 10000;
-			long time = txStop - txStart;
-			//while (readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PACKETSENT == 0x00); // wait for ModeReady
-			SetMode(Mode.RF69_MODE_STANDBY);
-			interruptPin.EnableInterrupt();
+			SetMode(Mode.MODE_RX);
 		}
 
-		public void ReceiveBegin()
+		public void EnableReceiver()
 		{
-			byte temp = ReadRegister(ConfigurationRegister.IrqFlags2);
-			if ((ReadRegister(ConfigurationRegister.IrqFlags2) & 0x04) == 0x04)
+			SetMode(Mode.MODE_STANDBY);
+			
+			// Clear the FIFO
+			while ((ReadRegister(ConfigurationRegister.IrqFlags2) & 0x40) == 0x40)
 			{
-				WriteRegister(ConfigurationRegister.PacketConfig2, (byte)((ReadRegister(ConfigurationRegister.PacketConfig2) & 0xFB) | 0x04)); // avoid RX deadlocks
+				ReadRegister(ConfigurationRegister.Fifo);
 			}
-			WriteRegister(ConfigurationRegister.DioMapping1, 0x40); // set DIO0 to "PAYLOADREADY" in receive mode
-			SetMode(Mode.RF69_MODE_RX);
-		}
-
-		void OutputAllRegs()
-		{
-			byte regVal;
-
-			for (byte regAddr = 1; regAddr <= 0x4F; regAddr++)
-			{
-				regVal = ReadRegister(regAddr);
-				Debug.Print(regAddr.ToString("X2") + " - " + regVal.ToString("X2"));
-			}
+			
+			// Set DIO0 to PayloadReady
+			WriteRegister(ConfigurationRegister.DioMapping1, 0x40);
+			SetMode(Mode.MODE_RX);
 		}
 
 		public void SetMode(Mode newMode)
@@ -283,28 +330,29 @@ namespace Gateway
 
 			switch (newMode)
 			{
-				case Mode.RF69_MODE_TX:
-					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x0C));
+				case Mode.MODE_TX:
+					WriteRegister(ConfigurationRegister.OpMode, (byte)((ReadRegister(ConfigurationRegister.OpMode) & 0xE3) | 0x0C));
 					break;
-				case Mode.RF69_MODE_RX:
-					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x10));
+				case Mode.MODE_RX:
+					WriteRegister(ConfigurationRegister.OpMode, (byte)((ReadRegister(ConfigurationRegister.OpMode) & 0xE3) | 0x10));
 					break;
-				case Mode.RF69_MODE_SYNTH:
-					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x08));
+				case Mode.MODE_SYNTH:
+					WriteRegister(ConfigurationRegister.OpMode, (byte)((ReadRegister(ConfigurationRegister.OpMode) & 0xE3) | 0x08));
 					break;
-				case Mode.RF69_MODE_STANDBY:
-					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x04));
+				case Mode.MODE_STANDBY:
+					WriteRegister(ConfigurationRegister.OpMode, (byte)((ReadRegister(ConfigurationRegister.OpMode) & 0xE3) | 0x04));
 					break;
-				case Mode.RF69_MODE_SLEEP:
-					WriteRegister(0x01, (byte)((ReadRegister(0x01) & 0xE3) | 0x00));
+				case Mode.MODE_SLEEP:
+					WriteRegister(ConfigurationRegister.OpMode, (byte)((ReadRegister(ConfigurationRegister.OpMode) & 0xE3) | 0x00));
 					break;
 				default:
 					return;
 			}
 
-			// we are using packet mode, so this check is not really needed
-			// but waiting for mode ready is necessary when going from sleep because the FIFO may not be immediately available from previous mode
-			while (currentMode == 0 && (ReadRegister(0x27) & 0x80) == 0x00) ; // wait for ModeReady
+			while ((ReadRegister(ConfigurationRegister.IrqFlags1) & 0x80) == 0x00)
+			{
+				// Wait for ModeReady
+			}
 
 			currentMode = newMode;
 		}

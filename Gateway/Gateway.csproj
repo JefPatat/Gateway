@@ -37,6 +37,9 @@
       <DesignTime>True</DesignTime>
       <DependentUpon>Resources.resx</DependentUpon>
     </Compile>
+    <Compile Include="SimpleWirelessProtocolNode.cs" />
+    <Compile Include="IntelliStatNode.cs" />
+    <Compile Include="SWPManager.cs" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="GHI.Hardware, Version=4.3.6.0, Culture=neutral, processorArchitecture=MSIL" />
